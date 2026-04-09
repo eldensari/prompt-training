@@ -966,12 +966,12 @@ def _tavily_usage_credits() -> int | None:
     tavily-python). The endpoint is GET https://api.tavily.com/usage
     with ``Authorization: Bearer $TAVILY_API_KEY``.
 
-    Note: the exact JSON shape of /usage is provider-defined and was
-    not verified at Phase 5 implementation time. The function tries
-    several common keys (``credits``, ``credits_used``, ``usage``,
-    ``total``) and returns ``None`` if none match. The Phase 6 smoke
-    test should make one manual call against /usage to lock down the
-    actual key, after which this fallback list can be tightened.
+    Note: the /usage response shape was locked down at Phase 6b Block 6.
+    The account-level counter lives at ``data["account"]["plan_usage"]``
+    (current) and ``data["account"]["plan_limit"]`` (quota). We read
+    plan_usage primarily; key.usage is a secondary fallback for
+    per-key metering. Both can lag real-time usage by several seconds
+    (eventual consistency observed during Phase 6b).
     """
     api_key = os.environ.get("TAVILY_API_KEY")
     if not api_key:
@@ -987,9 +987,14 @@ def _tavily_usage_credits() -> int | None:
         )
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))
-            for key in ("credits", "credits_used", "usage", "total"):
-                if key in data:
-                    return int(data[key])
+            # Primary: account.plan_usage (verified via Phase 6b Block 6).
+            account = data.get("account")
+            if isinstance(account, dict) and "plan_usage" in account:
+                return int(account["plan_usage"])
+            # Secondary fallback: key.usage (per-key counter, may be eventual).
+            key_info = data.get("key")
+            if isinstance(key_info, dict) and "usage" in key_info:
+                return int(key_info["usage"])
             # Unknown shape -- prefer None over a guess.
             return None
     except (
@@ -1265,6 +1270,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
     global MODEL, N_SAMPLES, _caching_enabled
+
+    # Load .env from the project root. python-dotenv is in pyproject.toml
+    # dependencies, so it's guaranteed available after `pip install -e .`.
+    # This makes `python benchmark.py ...` work directly without needing
+    # an inline .env loader wrapper.
+    from dotenv import load_dotenv
+    load_dotenv()
 
     args = _parse_args(argv)
     if args.model:
