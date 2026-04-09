@@ -25,7 +25,7 @@ We test this with an A/B experiment on GAIA Level 1 and measure the effect as **
                                     ▼
                       ┌─────────────────────────────┐
      raw GAIA task ──▶│  condition B (inverse pre)  │──▶ ReAct agent ──▶ verifier
-                      │   Target → Invert → Output  │
+                      │   Target → Invert → Compose │
                       └─────────────────────────────┘
 
      measure H_raw ─────────────────┐
