@@ -69,9 +69,12 @@ MEASUREMENT_QUESTION: str = (
 
 #: Together AI embedding model used by ``semantic_cluster``. The clustering
 #: geometry depends on this -- changing it requires a CACHE_VERSION bump.
-#: Together's catalog evolves; verify this id is currently served before a
-#: result-producing run.
-EMBEDDING_MODEL: str = "togethercomputer/m2-bert-80M-32k-retrieval"
+#: As of v2.8.1 (April 2026) Together AI's serverless catalog has
+#: consolidated to a single embedding model: intfloat/multilingual-e5-large-
+#: instruct (1024-dim, 514-token context). The "neutral and external"
+#: constraint from spec/measurement.md is satisfied -- the embedder is
+#: separate from the generation model.
+EMBEDDING_MODEL: str = "intfloat/multilingual-e5-large-instruct"
 
 #: Together AI OpenAI-compatible base URL.
 TOGETHER_BASE_URL: str = "https://api.together.xyz/v1"
@@ -281,11 +284,12 @@ def trim_to_tail(text: str, max_tokens: int = 150) -> str:
 def semantic_cluster(responses: list[str]) -> list[int]:
     """Embed N responses and cluster on cosine similarity.
 
-    Embeddings come from Together AI's Llama-3-family embedder via the
-    OpenAI-compatible interface. Clustering uses scikit-learn's
-    AgglomerativeClustering with average linkage and a fixed cosine
-    distance threshold of 0.15. Both the embedder identity and the
-    threshold are NOT editable without a version bump (see
+    Embeddings come from Together AI's serverless embedder via the
+    OpenAI-compatible interface (currently intfloat/multilingual-e5-
+    large-instruct -- see EMBEDDING_MODEL). Clustering uses scikit-
+    learn's AgglomerativeClustering with average linkage and a fixed
+    cosine distance threshold of 0.15. Both the embedder identity and
+    the threshold are NOT editable without a version bump (see
     spec/measurement.md).
 
     Returns a list of cluster labels in the same order as ``responses``.
@@ -399,6 +403,11 @@ Constraints:
 Output the paragraph only, with no preamble or commentary."""
 
 
+# k=4 enforcement is instruction-only in v0: the template tells the LLM
+# "stop at 5 steps total" but inverse() does not parse the LLM's output
+# to verify the chain length. A stricter parsing-based enforcement is a
+# post-Phase-6 decision — adding it now would introduce a confounding
+# variable (effect of inverse model vs effect of stricter enforcement).
 def prompt_invert(target: str, raw_prompt: str) -> str:
     """Step 2 (Invert): macro-level backward chaining. The work of g."""
     return f"""\
@@ -587,6 +596,11 @@ def detect_loop(
 
     # "approximately zero" tolerance band: small fraction of H_raw.
     # Anything inside +/- TOL is treated as flat.
+    # Tolerance band: 5% of H_raw. spec/loop-detection.md leaves "≈ 0" as an
+    # implementation detail. This value is a tuning candidate — revisit after
+    # Phase 6 smoke tests based on actual entropy curve shapes. Per the
+    # spec's editability table, the exact tolerance is editable; only the
+    # `d²H/dt² ≈ 0 AND H > α·H_raw` shape and `α = 0.3` are version-locked.
     tol = 0.05 * max(H_raw, 1e-9)
     flattened = all(abs(d2) <= tol for d2 in second_diffs)
 
