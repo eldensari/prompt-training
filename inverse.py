@@ -6,12 +6,22 @@ Entropy is measured only at the raw prompt and the improved prompt.
 
 Public interface (call signatures match implementation/inverse.md):
     MINIMAL_INSTRUCTION : str
-    summarize_to_head(text, max_tokens=80, *, model)            -> str
+    summarize_to_head(text, max_tokens=80, *, model)            -> tuple[str, int]
+    summarize_to_body(prev, displaced, *, model, max_tokens=70) -> tuple[str, int]
     trim_to_tail(text, max_tokens=150)                          -> str
     semantic_cluster(responses)                                 -> list[int]
-    measure_semantic_entropy(input_context, model, n_samples=10)-> float
+    measure_semantic_entropy(input_context, model, n_samples=10)-> tuple[float, int]
     inverse(raw_prompt, model, n_samples=10)                    -> dict
     detect_loop(entropy_history, H_raw, alpha=0.3, window=3)    -> dict
+
+Token-counting note: as of Phase 4b, summarize_to_head, summarize_to_body,
+and measure_semantic_entropy all return ``(value, total_tokens)`` tuples.
+The second element is the sum of input + output tokens from every LLM
+call inside the function. inverse()'s ``total_tokens_used`` field now
+correctly accounts for ALL of: the 2 summarize_to_head calls, the 2
+measure_semantic_entropy calls, and the 3 Target/Invert/Compose calls.
+(Pre-4b, only the 3 generation calls were counted, undercounting B's
+true token cost.)
 
 Design notes:
   * No conversation history is shared between the three inverse-model
@@ -200,7 +210,9 @@ Source:
 """
 
 
-def summarize_to_head(text: str, max_tokens: int = 80, *, model: str) -> str:
+def summarize_to_head(
+    text: str, max_tokens: int = 80, *, model: str
+) -> tuple[str, int]:
     """Compress ``text`` to at most ``max_tokens`` tokens.
 
     Used to produce the 80-token Head for both H_raw and H_improved
@@ -212,13 +224,16 @@ def summarize_to_head(text: str, max_tokens: int = 80, *, model: str) -> str:
     * The summarizer's residual variance is intentional. It cancels in
       delta_H because both H_raw and H_improved share this pipeline.
       See spec/measurement.md "The cancellation argument".
+
+    Returns ``(summary, tokens_used)`` where ``tokens_used`` is the
+    sum of input + output tokens from the single LLM call.
     """
     prompt = _SUMMARIZE_TEMPLATE.format(
         max_tokens=max_tokens,
         max_chars=max_tokens * _CHARS_PER_TOKEN,
         text=text,
     )
-    summary, _in, _out = _llm_call(
+    summary, in_tok, out_tok = _llm_call(
         prompt,
         model=model,
         temperature=0.0,
@@ -232,7 +247,91 @@ def summarize_to_head(text: str, max_tokens: int = 80, *, model: str) -> str:
     char_budget = max_tokens * _CHARS_PER_TOKEN
     if len(summary) > char_budget:
         summary = summary[:char_budget].rstrip()
-    return summary
+    return summary, in_tok + out_tok
+
+
+# ---------------------------------------------------------------------------
+# 2b. summarize_to_body
+# ---------------------------------------------------------------------------
+
+
+_BODY_SUMMARIZE_TEMPLATE = """\
+You are maintaining a running 70-token summary of an AI agent's execution history. The agent works on a task by alternating Thought, Action (tool call), and Observation. As steps advance, older steps slide out of the recent-action window and must be folded into this running summary so the agent does not lose track of what has already been established.
+
+You receive two inputs:
+
+PRIOR SUMMARY (the running summary of everything BEFORE the displaced content; may be empty if this is the first time we are summarising):
+\"\"\"
+{previous_body}
+\"\"\"
+
+DISPLACED CONTENT (the chunk that just slid out of the recent-action window — must now be integrated into the running summary):
+\"\"\"
+{displaced_content}
+\"\"\"
+
+Update the running summary by integrating the displaced content into the prior summary. Output the new summary in at most {max_tokens} tokens (~{max_chars} characters).
+
+What to PRESERVE:
+- Facts the agent has confirmed (e.g. "established that X = ...", "ruled out Y").
+- Open questions still unresolved.
+- The agent's current line of inquiry — what it is currently trying to establish.
+
+What to DROP:
+- Greetings, hedging, meta-commentary about reasoning ("I should think about...", "Let me consider...").
+- Step numbers, exact tool names, exact wording of search queries.
+- Anything that does not advance the agent's understanding of the task.
+
+Constraints:
+- Output the new summary only. No preamble. No labels. No explanation.
+- Older facts compress more aggressively than newer ones; the displaced content (which is the newest material to be summarised) gets relatively more space than older items already compressed in the prior summary.
+- If the prior summary is empty or "(none yet)", produce a fresh summary of the displaced content alone.
+- Write in the third person, in declarative present tense.
+"""
+
+
+def summarize_to_body(
+    previous_body: str,
+    displaced_content: str,
+    *,
+    model: str,
+    max_tokens: int = 70,
+) -> tuple[str, int]:
+    """Recursively summarise the agent's execution history into the Body slot.
+
+    Called by ``run_react_loop`` at each step from step 3 onward, when
+    a previous step's content has slid past the n-2 boundary and must
+    be integrated into the running 70-token Body summary.
+
+    * ``previous_body``: the Body summary as of the previous step.
+      Empty string for the first call (step 3, when nothing has been
+      summarised yet).
+    * ``displaced_content``: the raw thought+action+observation text
+      from the step that just slid out of the recent-action window.
+    * temperature = 0 (deterministic recursive compression).
+    * 70-token cap is load-bearing per spec/token-budget.md.
+
+    Returns ``(new_body, tokens_used)``.
+    """
+    prompt = _BODY_SUMMARIZE_TEMPLATE.format(
+        max_tokens=max_tokens,
+        max_chars=max_tokens * _CHARS_PER_TOKEN,
+        previous_body=previous_body if previous_body else "(none yet)",
+        displaced_content=displaced_content if displaced_content else "(none)",
+    )
+    summary, in_tok, out_tok = _llm_call(
+        prompt,
+        model=model,
+        temperature=0.0,
+        max_tokens=max_tokens + 16,
+    )
+    summary = summary.strip()
+
+    # Hard cap by character budget (same safety net as summarize_to_head).
+    char_budget = max_tokens * _CHARS_PER_TOKEN
+    if len(summary) > char_budget:
+        summary = summary[:char_budget].rstrip()
+    return summary, in_tok + out_tok
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +433,7 @@ def measure_semantic_entropy(
     input_context: str,
     model: str,
     n_samples: int = 10,
-) -> float:
+) -> tuple[float, int]:
     """Sample, cluster, and return Shannon entropy of the cluster distribution.
 
     * ``input_context`` is used as the system prompt -- typically
@@ -345,21 +444,26 @@ def measure_semantic_entropy(
       never edited (see spec/measurement.md).
     * Sampling temperature is fixed at 0.7. Anything else changes what
       H means.
+
+    Returns ``(entropy, tokens_used)`` where ``tokens_used`` is the
+    sum of input + output tokens across all ``n_samples`` LLM calls.
     """
     samples: list[str] = []
+    total_tokens = 0
     for _ in range(n_samples):
-        text, _in, _out = _llm_call(
+        text, in_tok, out_tok = _llm_call(
             MEASUREMENT_QUESTION,
             model=model,
             temperature=ENTROPY_SAMPLING_TEMPERATURE,
             max_tokens=256,
             system=input_context,
         )
+        total_tokens += in_tok + out_tok
         samples.append(text.strip())
 
     labels = semantic_cluster(samples)
     if not labels:
-        return 0.0
+        return 0.0, total_tokens
 
     counts = Counter(labels)
     total = sum(counts.values())
@@ -368,7 +472,7 @@ def measure_semantic_entropy(
         p = count / total
         if p > 0:
             entropy -= p * math.log2(p)
-    return entropy
+    return entropy, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -492,12 +596,16 @@ def inverse(
     total_tokens = 0
 
     # 1. Original query -> 80-token summary -> measure H_raw
-    raw_summary = summarize_to_head(raw_prompt, max_tokens=80, model=model)
-    H_raw = measure_semantic_entropy(
+    raw_summary, raw_summary_tokens = summarize_to_head(
+        raw_prompt, max_tokens=80, model=model
+    )
+    total_tokens += raw_summary_tokens
+    H_raw, H_raw_tokens = measure_semantic_entropy(
         f"{MINIMAL_INSTRUCTION}\n\n{raw_summary}",
         model=model,
         n_samples=n_samples,
     )
+    total_tokens += H_raw_tokens
 
     # 2. Run the 3 inverse-model steps (independent prompt chaining)
     target_text, in1, out1 = _llm_call(
@@ -527,12 +635,16 @@ def inverse(
     improved_prompt = improved_prompt.strip()
 
     # 3. Refined query -> 80-token summary -> measure H_improved
-    improved_summary = summarize_to_head(improved_prompt, max_tokens=80, model=model)
-    H_improved = measure_semantic_entropy(
+    improved_summary, improved_summary_tokens = summarize_to_head(
+        improved_prompt, max_tokens=80, model=model
+    )
+    total_tokens += improved_summary_tokens
+    H_improved, H_improved_tokens = measure_semantic_entropy(
         f"{MINIMAL_INSTRUCTION}\n\n{improved_summary}",
         model=model,
         n_samples=n_samples,
     )
+    total_tokens += H_improved_tokens
 
     return {
         "raw_prompt": raw_prompt,
