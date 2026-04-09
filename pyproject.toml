@@ -17,3 +17,6 @@ dependencies = [
 
 [project.scripts]
 prompt-training = "benchmark:main"
+
+[tool.setuptools]
+py-modules = ["benchmark", "inverse", "agent_tools", "gaia_scorer"]
