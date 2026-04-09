@@ -36,10 +36,8 @@ The three Python files are described in [inverse.md](./inverse.md), [benchmark.m
 ## `.env.example`
 
 ```
-# Core LLM API keys (set at least one; MODEL determines which is used)
+# LLM API key (Anthropic only — v0 single-model policy)
 ANTHROPIC_API_KEY=
-OPENAI_API_KEY=
-GOOGLE_API_KEY=
 
 # Embedding model (required for semantic clustering)
 TOGETHER_API_KEY=
@@ -55,7 +53,7 @@ TAVILY_API_KEY=
 
 `TOGETHER_API_KEY` is required for the embedding-based clustering — see [../spec/measurement.md §Clustering](../spec/measurement.md#clustering-what-we-ask-of-it). It is independent of which generation provider is used.
 
-The Anthropic / OpenAI / Google keys are interchangeable in the sense that exactly one of them needs to be set, and which one depends on the value of `MODEL`. The single-model policy ([agent-tools.md §LLM model](./agent-tools.md#llm-model-single-model-policy)) means only one provider is exercised per run.
+Only `ANTHROPIC_API_KEY` is required for generation. The single-model policy ([agent-tools.md §LLM model](./agent-tools.md#llm-model-single-model-policy)) fixes `MODEL` to a Claude variant in v0; other generation providers are intentionally not configured.
 
 ---
 
@@ -64,12 +62,12 @@ The Anthropic / OpenAI / Google keys are interchangeable in the sense that exact
 ```toml
 [project]
 name = "prompt-training"
-version = "2.7.9"
+version = "2.8.1"
 description = "Inverse model pre-processing reduces agent loops: a semantic entropy measurement framework on GAIA"
 requires-python = ">=3.10"
 dependencies = [
     "anthropic>=0.40.0",
-    "openai>=1.50.0",
+    "openai>=1.50.0",  # client lib for Together AI's OpenAI-compatible embeddings endpoint
     "numpy>=1.24.0",
     "matplotlib>=3.7.0",
     "python-dotenv>=1.0.0",
@@ -79,13 +77,8 @@ dependencies = [
     "huggingface_hub>=0.20.0",
 ]
 
-[project.optional-dependencies]
-google = ["google-generativeai>=0.8.0"]
-
 [project.scripts]
 prompt-training = "benchmark:main"
 ```
 
-The `version` field tracks the spec version and should be bumped together with `CHANGELOG.md` whenever a load-bearing element changes — see [../operations/experiment-rules.md](../operations/experiment-rules.md). Note that the `pyproject.toml` version may lag the spec by a patch level during the multi-file restructuring (v2.8.0 spec on v2.7.9 code) until the implementation is also stamped.
-
-`google-generativeai` is optional because Gemini is not the default model — only required if `MODEL` is set to a Gemini variant.
+The `version` field tracks the spec version and should be bumped together with `CHANGELOG.md` whenever a load-bearing element changes — see [../operations/experiment-rules.md](../operations/experiment-rules.md).

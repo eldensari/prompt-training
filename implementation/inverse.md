@@ -68,7 +68,7 @@ Procedure:
 - `input_context = [minimal instruction] + [query or 300-token state]`
 - Fix `input_context` as the system prompt.
 - Sample the user question — `"What concrete action will the agent take next?"` — `n_samples` times at temperature 0.7.
-- Embed the responses with Together AI's Llama-3 embedding model.
+- Embed the responses with the Together AI embedding model (currently `intfloat/multilingual-e5-large-instruct` — see [../spec/measurement.md](../spec/measurement.md#clustering-what-we-ask-of-it)). The load-bearing constraint is that the embedder is "neutral and external" — separate from the generation model — not that it is specifically Llama-3.
 - Cluster on cosine similarity (`AgglomerativeClustering`, average linkage, `distance_threshold=0.15`).
 - Return the Shannon entropy of the resulting cluster distribution.
 
@@ -76,7 +76,7 @@ The fixed measurement question, the temperature, the sample size, the clustering
 
 ### `semantic_cluster(responses)`
 
-The clustering primitive. Embed `N` responses via Together AI (`base_url="https://api.together.xyz/v1"`, OpenAI-compatible interface) using the Llama-3 embedding model, then cluster:
+The clustering primitive. Embed `N` responses via Together AI (`base_url="https://api.together.xyz/v1"`, OpenAI-compatible interface) using `intfloat/multilingual-e5-large-instruct` — neutral and external relative to the generation model — then cluster:
 
 ```python
 AgglomerativeClustering(
