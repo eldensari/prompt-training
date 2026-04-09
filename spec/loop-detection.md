@@ -85,7 +85,7 @@ In short: `H_raw` is the reference in both conditions because the loop threshold
 
 ## The condition in pseudo-code
 
-`detect_loop` is implemented in `inverse.py`. The pseudo-code is given in [implementation/inverse.md](../implementation/inverse.md#detect_loop), and its parameters are:
+`detect_loop` is implemented in `inverse.py`. The pseudo-code is given in [implementation/inverse.md](../implementation/inverse.md), and its parameters are:
 
 - `entropy_history`: the list of `H_n` values measured at each ReAct step so far.
 - `H_raw`: the per-task baseline. Passed in by `run_react_loop` from `run_single_task` — the same number whether the call is for condition A or condition B.

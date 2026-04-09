@@ -35,7 +35,7 @@ We test this with an A/B experiment on GAIA Level 1 and measure the effect as **
 
 Both conditions run the same ReAct loop, the same tool set, the same verifier. The only difference is whether the prompt passes through `inverse()` first.
 
-→ [spec/experiment-structure.md](./spec/experiment-structure.md) for the full A/B pseudocode.
+→ [implementation/benchmark.md](./implementation/benchmark.md) for the full A/B pseudocode.
 
 ---
 
