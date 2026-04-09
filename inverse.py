@@ -28,6 +28,10 @@ Design notes:
   * Heavy dependencies (anthropic, openai, sklearn, numpy) are
     lazy-imported inside the functions that need them, so importing
     this module never requires API keys or installed packages.
+    Note: `openai` is the client library used to call the Together AI
+    embeddings endpoint, which is OpenAI-compatible. v0 does not call
+    OpenAI's own models — see spec/measurement.md "Implementation note"
+    in the Clustering section.
 
 Usage example (after .env is populated):
 

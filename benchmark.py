@@ -63,7 +63,7 @@ N_SAMPLES: int = 10
 #: Cache version. Bump on any change to model, N_SAMPLES, clustering
 #: threshold, or any prompt template that affects a cached value.
 #: See implementation/caching.md.
-CACHE_VERSION: str = "v2.8.0-001"
+CACHE_VERSION: str = "v2.8.1-001"
 
 #: Seed for any future stochastic operation. The embedder and clusterer
 #: are deterministic by construction; this seed exists as a fixed entry
