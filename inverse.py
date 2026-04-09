@@ -110,6 +110,70 @@ _CHARS_PER_TOKEN: int = 4
 
 
 # ---------------------------------------------------------------------------
+# Cost monitoring shared state (Phase 5)
+# ---------------------------------------------------------------------------
+#
+# These mutable module-level objects are SHARED with benchmark.py via
+# ``from inverse import _llm_token_accumulator, ...``. Importing a name
+# binds the local name in the importer to the SAME object; mutations
+# from either file affect the same dict.
+#
+# IMPORTANT: never REBIND these names (e.g. ``_llm_token_accumulator =
+# {}``). Doing so creates a new object that benchmark.py's existing
+# reference cannot see, breaking cost monitoring silently. To reset,
+# ALWAYS use ``.clear()``. log_cost_start in benchmark.py relies on
+# this.
+#
+# Phase 5 wires these as follows:
+#   * inverse.py's _llm_call records every Anthropic generation call
+#     via _record_llm_tokens("anthropic", in_tok, out_tok).
+#   * inverse.py's semantic_cluster records every Together AI
+#     embedding call via _record_llm_tokens("together", emb_tokens, 0).
+#   * benchmark.py's _call_agent_with_retries._one_call records every
+#     agent Thought/Action call via _record_llm_tokens("anthropic", ...).
+#   * benchmark.py's cache_hit() increments _cache_hit_counters.
+#   * benchmark.py's log_cost_start() / log_cost_end() consume these.
+
+#: Per-provider LLM token accumulator. Reset at log_cost_start; read
+#: at log_cost_end. Keys are provider identifiers
+#: ({"anthropic", "together"} in v0). Values are dicts with
+#: ``input_tokens`` and ``output_tokens`` integers.
+_llm_token_accumulator: dict[str, dict[str, int]] = {}
+
+#: Per-cache-subdir hit/miss counters. Reset at log_cost_start; read
+#: at log_cost_end. Only cache_hit() in benchmark.py increments these
+#: -- cache_get() does NOT (per operations/cost-monitoring.md, "the
+#: latter could mask misses as errors").
+_cache_hit_counters: dict[str, dict[str, int]] = {}
+
+#: Per-run scratchpad: starting Tavily credits, started_at timestamp,
+#: any other run-level state log_cost_start needs to remember for
+#: log_cost_end. Reset (.clear()) at log_cost_start.
+_run_state: dict = {}
+
+
+def _record_llm_tokens(
+    provider: str, input_tokens: int, output_tokens: int
+) -> None:
+    """Add tokens to the per-provider accumulator.
+
+    Called from every LLM-touching code path:
+      * Generation (Anthropic Messages API): "anthropic"
+      * Embedding (Together AI OpenAI-compat API): "together"
+    Unknown provider names are accepted (recorded under their name)
+    but will produce a warning at log_cost_end if no pricing entry
+    exists.
+    """
+    if provider not in _llm_token_accumulator:
+        _llm_token_accumulator[provider] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+    _llm_token_accumulator[provider]["input_tokens"] += int(input_tokens)
+    _llm_token_accumulator[provider]["output_tokens"] += int(output_tokens)
+
+
+# ---------------------------------------------------------------------------
 # Lazy clients
 # ---------------------------------------------------------------------------
 
@@ -194,6 +258,8 @@ def _llm_call(
     text = "".join(text_parts)
     in_tok = int(getattr(response.usage, "input_tokens", 0))
     out_tok = int(getattr(response.usage, "output_tokens", 0))
+    # Cost monitoring (Phase 5): record into the shared accumulator.
+    _record_llm_tokens("anthropic", in_tok, out_tok)
     return text, in_tok, out_tok
 
 
@@ -409,6 +475,21 @@ def semantic_cluster(responses: list[str]) -> list[int]:
         input=responses,
     )
     embeddings = [item.embedding for item in embed_response.data]
+
+    # Cost monitoring (Phase 5): record Together AI embedding tokens
+    # into the shared accumulator. Field name varies by SDK version,
+    # so try total_tokens first, then prompt_tokens, then 0 if neither
+    # is present. Output tokens are 0 for embeddings -- the output is
+    # the vectors, which are not billed by token.
+    embedding_tokens = 0
+    if hasattr(embed_response, "usage") and embed_response.usage is not None:
+        usage = embed_response.usage
+        embedding_tokens = (
+            getattr(usage, "total_tokens", None)
+            or getattr(usage, "prompt_tokens", None)
+            or 0
+        )
+    _record_llm_tokens("together", int(embedding_tokens), 0)
 
     import numpy as np  # type: ignore
     from sklearn.cluster import AgglomerativeClustering  # type: ignore

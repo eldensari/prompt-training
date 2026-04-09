@@ -34,12 +34,17 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from inverse import (
     MINIMAL_INSTRUCTION,
+    _cache_hit_counters,
     _get_anthropic_client,
+    _llm_token_accumulator,
+    _record_llm_tokens,
+    _run_state,
     detect_loop,
     inverse,
     measure_semantic_entropy,
@@ -108,6 +113,38 @@ _caching_enabled: bool = True
 
 
 # ---------------------------------------------------------------------------
+# Cost monitoring constants (Phase 5)
+# ---------------------------------------------------------------------------
+
+#: LLM pricing as of 2026-04-08, looked up from official sources at
+#: implementation time (NOT from training data). Keys are model
+#: identifiers; values are (input_price_per_million, output_price_per_million)
+#: in USD.
+#:
+#: Anthropic prices verified at:
+#:   https://platform.claude.com/docs/en/about-claude/pricing
+#: Together AI prices verified at:
+#:   https://docs.together.ai/docs/serverless-models
+#:
+#: Pricing changes frequently. Re-verify before any result-producing
+#: run. The lookup date is recorded in PRICING_LOOKUP_DATE so a stale
+#: entry is at least visible.
+LLM_PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    "claude-sonnet-4-6": (3.00, 15.00),
+}
+
+#: Together AI embedding pricing -- single rate, not split into input
+#: and output. Embeddings have no "output tokens" in the LLM sense:
+#: the output is the vector, which is not billed by token.
+TOGETHER_EMBEDDING_PRICING_USD_PER_MTOK: float = 0.02
+
+#: Date the above prices were last verified against official pricing
+#: pages. Update whenever the constants are re-confirmed. log_cost_start
+#: prints this so the operator can see how stale the pricing is.
+PRICING_LOOKUP_DATE: str = "2026-04-08"
+
+
+# ---------------------------------------------------------------------------
 # Cache helpers
 # ---------------------------------------------------------------------------
 
@@ -161,10 +198,25 @@ def cache_set(subdir: str, key: str, value) -> None:
 
 
 def cache_hit(subdir: str, key: str) -> bool:
-    """Cheap existence check (no JSON decode). Used by cost monitoring."""
+    """Cheap existence check (no JSON decode).
+
+    Increments the per-subdir hit/miss counter for the cost-monitoring
+    layer. Per operations/cost-monitoring.md, only ``cache_hit`` updates
+    counters -- ``cache_get`` does NOT, because cache_get exceptions
+    could mask misses as errors. Callers that want their lookups to
+    appear in the hit-rate report should call cache_hit FIRST and only
+    call cache_get on a hit.
+    """
     if not _caching_enabled:
         return False
-    return (CACHE_ROOT / subdir / f"{key}.json").exists()
+    if subdir not in _cache_hit_counters:
+        _cache_hit_counters[subdir] = {"hits": 0, "misses": 0}
+    exists = (CACHE_ROOT / subdir / f"{key}.json").exists()
+    if exists:
+        _cache_hit_counters[subdir]["hits"] += 1
+    else:
+        _cache_hit_counters[subdir]["misses"] += 1
+    return exists
 
 
 # ---------------------------------------------------------------------------
@@ -312,9 +364,11 @@ def run_task_both_conditions(task: dict) -> list[dict]:
     """Run one task under both A and B. Returns a list of two rows."""
     task_key = _cache_key(task["task_id"], MODEL, N_SAMPLES)
 
-    # Step 1: H_raw (shared between A and B)
-    cached = cache_get("h_raw", task_key)
-    if cached is not None:
+    # Step 1: H_raw (shared between A and B). Use cache_hit() first
+    # so the hit/miss counter increments for the cost-monitoring
+    # layer; only call cache_get on a confirmed hit.
+    if cache_hit("h_raw", task_key):
+        cached = cache_get("h_raw", task_key)
         H_raw = cached["H_raw"]
         raw_summary = cached["raw_summary"]
     else:
@@ -346,9 +400,11 @@ def run_task_both_conditions(task: dict) -> list[dict]:
         model=MODEL,
     )
 
-    # Step 3: Condition B -- inverse() with its own cache
-    cached_inv = cache_get("inverse", task_key)
-    if cached_inv is not None:
+    # Step 3: Condition B -- inverse() with its own cache. Same
+    # cache_hit -> cache_get pattern as the H_raw lookup above so the
+    # inverse cache hit rate is captured.
+    if cache_hit("inverse", task_key):
+        cached_inv = cache_get("inverse", task_key)
         improved_prompt = cached_inv["improved_prompt"]
     else:
         inverse_result = inverse(task["Question"], MODEL, N_SAMPLES)
@@ -515,9 +571,14 @@ def _call_agent_with_retries(
             tools=TOOL_SCHEMA,
             messages=messages,
         )
-        total_tokens += int(response.usage.input_tokens) + int(
-            response.usage.output_tokens
-        )
+        in_tok = int(response.usage.input_tokens)
+        out_tok = int(response.usage.output_tokens)
+        total_tokens += in_tok + out_tok
+        # Cost monitoring (Phase 5): record into the shared accumulator.
+        # The agent's Thought/Action calls happen here in benchmark.py
+        # rather than via inverse._llm_call, so this is a separate
+        # recording site.
+        _record_llm_tokens("anthropic", in_tok, out_tok)
         return response
 
     def _extract(response):
@@ -846,16 +907,268 @@ def write_tsv(rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _tavily_usage_credits() -> int | None:
+    """Fetch the current Tavily credit balance via the /usage endpoint.
+
+    Returns the integer credit count, or ``None`` if the call fails
+    for any reason (key missing, network error, unexpected response
+    shape). Failure is non-fatal -- the run continues, but the cost
+    log records "Tavily delta unavailable" so the operator knows
+    something went wrong without crashing the run.
+
+    Uses ``urllib.request`` from stdlib (no new dependency on
+    tavily-python). The endpoint is GET https://api.tavily.com/usage
+    with ``Authorization: Bearer $TAVILY_API_KEY``.
+
+    Note: the exact JSON shape of /usage is provider-defined and was
+    not verified at Phase 5 implementation time. The function tries
+    several common keys (``credits``, ``credits_used``, ``usage``,
+    ``total``) and returns ``None`` if none match. The Phase 6 smoke
+    test should make one manual call against /usage to lock down the
+    actual key, after which this fallback list can be tightened.
+    """
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(
+            "https://api.tavily.com/usage",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            for key in ("credits", "credits_used", "usage", "total"):
+                if key in data:
+                    return int(data[key])
+            # Unknown shape -- prefer None over a guess.
+            return None
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        ValueError,
+        KeyError,
+        TimeoutError,
+        OSError,
+    ):
+        return None
+
+
 def log_cost_start() -> None:
-    """Phase 5 will populate this with the Tavily /usage call and the
-    LLM-token accumulator initialisation."""
-    print("[cost] run start (Phase 5 will populate this)")
+    """Initialize cost monitoring at the start of a benchmark run.
+
+    Resets the per-provider token accumulator, the cache hit
+    counters, and the per-run scratchpad. Captures the starting
+    Tavily credit balance into ``_run_state``.
+
+    Per operations/cost-monitoring.md, this runs ONCE per benchmark
+    invocation, not per task.
+
+    IMPORTANT: uses ``.clear()`` rather than reassignment so the
+    shared-state references in inverse.py and benchmark.py stay in
+    sync. See inverse.py "Cost monitoring shared state" for the
+    rationale.
+    """
+    _llm_token_accumulator.clear()
+    _cache_hit_counters.clear()
+    _run_state.clear()
+
+    tavily_start = _tavily_usage_credits()
+    _run_state["tavily_credits_at_start"] = tavily_start
+    _run_state["started_at"] = time.time()
+
+    print("[cost] run start")
+    if tavily_start is not None:
+        print(f"[cost]   Tavily credits at start: {tavily_start}")
+    else:
+        print(
+            "[cost]   Tavily /usage unavailable "
+            "(key missing or endpoint failed)"
+        )
+    print(f"[cost]   model: {MODEL}")
+    print(f"[cost]   N_SAMPLES: {N_SAMPLES}")
+    print(f"[cost]   CACHE_VERSION: {CACHE_VERSION}")
+    print(f"[cost]   pricing lookup date: {PRICING_LOOKUP_DATE}")
 
 
 def log_cost_end() -> None:
-    """Phase 5 will populate this with the Tavily /usage delta and the
-    per-provider LLM token + USD summary."""
-    print("[cost] run end (Phase 5 will populate this)")
+    """Compute and print the four cost categories at run end.
+
+    Reads from ``_llm_token_accumulator``, ``_cache_hit_counters``,
+    and ``_run_state``. Writes a single human-readable summary to
+    stdout and a detailed log file to ``results/run_<timestamp>.log``
+    via ``_write_run_log``. Cost data is NOT written to the TSV
+    (the TSV is per-task-per-condition; cost is per-run).
+    """
+    elapsed = time.time() - _run_state.get("started_at", time.time())
+
+    # --- 1. Tavily delta ---
+    tavily_end = _tavily_usage_credits()
+    tavily_start = _run_state.get("tavily_credits_at_start")
+    if tavily_start is not None and tavily_end is not None:
+        tavily_delta: int | None = tavily_end - tavily_start
+        tavily_str = f"{tavily_delta} credits"
+    else:
+        tavily_delta = None
+        tavily_str = "unavailable"
+
+    # --- 2. LLM token totals (across all providers) ---
+    total_input = sum(
+        p["input_tokens"] for p in _llm_token_accumulator.values()
+    )
+    total_output = sum(
+        p["output_tokens"] for p in _llm_token_accumulator.values()
+    )
+
+    # --- 3. USD estimate, per provider ---
+    total_usd = 0.0
+    per_provider_usd: dict[str, float] = {}
+    for provider, counts in _llm_token_accumulator.items():
+        if provider == "anthropic":
+            pricing = LLM_PRICING_USD_PER_MTOK.get(MODEL)
+            if pricing is None:
+                print(
+                    f"[cost]   WARNING: no pricing entry for "
+                    f"MODEL={MODEL!r}. USD estimate for anthropic "
+                    "will be 0."
+                )
+                per_provider_usd[provider] = 0.0
+                continue
+            input_price, output_price = pricing
+            usd = (
+                counts["input_tokens"] / 1_000_000 * input_price
+                + counts["output_tokens"] / 1_000_000 * output_price
+            )
+        elif provider == "together":
+            # Together embeddings: single rate, no input/output split.
+            # semantic_cluster records embedding tokens under
+            # input_tokens with output_tokens=0; sum both for safety
+            # in case a future call site puts tokens on the other side.
+            total_embedding_tokens = (
+                counts["input_tokens"] + counts["output_tokens"]
+            )
+            usd = (
+                total_embedding_tokens
+                / 1_000_000
+                * TOGETHER_EMBEDDING_PRICING_USD_PER_MTOK
+            )
+        else:
+            print(
+                f"[cost]   WARNING: no pricing for provider "
+                f"{provider!r}. USD estimate for this provider will "
+                "be 0."
+            )
+            usd = 0.0
+        per_provider_usd[provider] = usd
+        total_usd += usd
+
+    # --- 4. Cache hit rates ---
+    cache_summary: dict[str, str] = {}
+    for subdir, counts in _cache_hit_counters.items():
+        total = counts["hits"] + counts["misses"]
+        if total > 0:
+            rate = counts["hits"] / total
+            cache_summary[subdir] = (
+                f"{counts['hits']}/{total} ({rate:.1%})"
+            )
+        else:
+            cache_summary[subdir] = "0/0 (n/a)"
+
+    # --- Stdout summary lines (the four headline numbers) ---
+    print()
+    print("[cost] run end")
+    print(f"[cost]   elapsed: {elapsed:.1f}s")
+    print(f"[cost]   Tavily delta: {tavily_str}")
+    print(f"[cost]   LLM input tokens:  {total_input:,}")
+    print(f"[cost]   LLM output tokens: {total_output:,}")
+    for provider, usd in per_provider_usd.items():
+        counts = _llm_token_accumulator[provider]
+        print(
+            f"[cost]   {provider}: "
+            f"in={counts['input_tokens']:,} "
+            f"out={counts['output_tokens']:,} "
+            f"= ${usd:.4f}"
+        )
+    print(f"[cost]   estimated total USD: ${total_usd:.4f}")
+    print("[cost]   cache hit rates:")
+    for subdir, summary in cache_summary.items():
+        print(f"[cost]     {subdir}: {summary}")
+    print()
+
+    # --- Detailed log file (one per run) ---
+    _write_run_log(
+        tavily_delta=tavily_delta,
+        total_input=total_input,
+        total_output=total_output,
+        per_provider_usd=per_provider_usd,
+        total_usd=total_usd,
+        cache_summary=cache_summary,
+        elapsed=elapsed,
+    )
+
+
+def _write_run_log(
+    *,
+    tavily_delta: int | None,
+    total_input: int,
+    total_output: int,
+    per_provider_usd: dict[str, float],
+    total_usd: float,
+    cache_summary: dict[str, str],
+    elapsed: float,
+) -> None:
+    """Write the detailed cost log to ``results/run_<timestamp>.log``.
+
+    One file per benchmark invocation. Format is human-readable, not
+    structured JSON -- this file is for the operator's eyes during
+    review, not for downstream processing. (The TSV is the structured
+    artifact.)
+    """
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = RESULTS_DIR / f"run_{timestamp}.log"
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = [
+        "prompt-training run log",
+        f"  timestamp:        {timestamp}",
+        f"  model:            {MODEL}",
+        f"  N_SAMPLES:        {N_SAMPLES}",
+        f"  CACHE_VERSION:    {CACHE_VERSION}",
+        f"  SEED:             {SEED}",
+        f"  pricing date:     {PRICING_LOOKUP_DATE}",
+        f"  elapsed:          {elapsed:.1f}s",
+        "",
+        "Tavily delta:       "
+        + (
+            f"{tavily_delta} credits"
+            if tavily_delta is not None
+            else "unavailable"
+        ),
+        f"LLM input tokens:   {total_input:,}",
+        f"LLM output tokens:  {total_output:,}",
+        f"Total USD estimate: ${total_usd:.4f}",
+        "",
+        "Per-provider breakdown:",
+    ]
+    for provider, usd in per_provider_usd.items():
+        counts = _llm_token_accumulator[provider]
+        lines.append(
+            f"  {provider}: in={counts['input_tokens']:,} "
+            f"out={counts['output_tokens']:,} = ${usd:.4f}"
+        )
+    lines.append("")
+    lines.append("Cache hit rates:")
+    for subdir, summary in cache_summary.items():
+        lines.append(f"  {subdir}: {summary}")
+    lines.append("")
+
+    log_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[cost]   detailed log: {log_path}")
 
 
 # ---------------------------------------------------------------------------
