@@ -1,0 +1,27 @@
+# Secrets
+.env
+
+# Caches (per implementation/file-layout.md)
+cache/
+
+# Run artifacts (TSV and logs are written here; keep the directory tracked
+# but ignore the run outputs themselves)
+results/*.tsv
+results/*.log
+results/entropy_curves/*
+!results/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
