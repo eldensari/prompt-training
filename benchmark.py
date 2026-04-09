@@ -533,6 +533,48 @@ def _format_step_raw(
     return "\n".join(parts)
 
 
+def _cached_tavily_search(query: str) -> object:
+    """Cache-aware wrapper around agent_tools.tavily_search.
+
+    Consults cache/tavily/ before making a network call. The Tavily
+    response (raw dict) is the cached value, keyed on tool_name +
+    query + CACHE_VERSION per implementation/caching.md.
+
+    The wrapper exists in benchmark.py rather than agent_tools.py so
+    that agent_tools.py stays standalone (no benchmark.py imports).
+    Phase 4a defined agent_tools.py as a leaf module; Phase 5.5 keeps
+    that constraint.
+
+    Exceptions from tavily_search propagate as-is. Per
+    operations/failure-modes.md, run_react_loop catches them and
+    terminates the loop with terminated_by="error". cache_set is
+    only reached AFTER tavily_search returns successfully, so a
+    failed call never poisons the cache -- the next run with the
+    same query will be a cache miss again and will retry.
+    """
+    key = _cache_key("tavily_search", query)
+    if cache_hit("tavily", key):
+        return cache_get("tavily", key)
+    result = tavily_search(query)
+    cache_set("tavily", key, result)
+    return result
+
+
+def _cached_tavily_extract(url: str) -> object:
+    """Cache-aware wrapper around agent_tools.tavily_extract.
+
+    Same caching pattern as _cached_tavily_search. See that
+    function's docstring for the rationale on living in benchmark.py
+    rather than agent_tools.py and for the failure semantics.
+    """
+    key = _cache_key("tavily_extract", url)
+    if cache_hit("tavily", key):
+        return cache_get("tavily", key)
+    result = tavily_extract(url)
+    cache_set("tavily", key, result)
+    return result
+
+
 def _call_agent_with_retries(
     client,
     model: str,
@@ -777,7 +819,9 @@ def run_react_loop(
             # No observation for this step.
         elif action_name == "tavily_search":
             try:
-                observation = tavily_search(action_input.get("query", ""))
+                observation = _cached_tavily_search(
+                    action_input.get("query", "")
+                )
             except Exception:
                 # Tool exception -> error termination per
                 # operations/failure-modes.md. Tavily errors that come
@@ -792,7 +836,9 @@ def run_react_loop(
                 }
         elif action_name == "tavily_extract":
             try:
-                observation = tavily_extract(action_input.get("url", ""))
+                observation = _cached_tavily_extract(
+                    action_input.get("url", "")
+                )
             except Exception:
                 return {
                     "terminated_by": "error",
