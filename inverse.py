@@ -99,7 +99,7 @@ ENTROPY_SAMPLING_TEMPERATURE: float = 0.7
 
 #: AgglomerativeClustering distance threshold (cosine). Determines what
 #: counts as "the same meaning." NOT editable without a version bump.
-CLUSTERING_DISTANCE_THRESHOLD: float = 0.15
+CLUSTERING_DISTANCE_THRESHOLD: float = 0.08
 
 #: Approximate chars-per-token used by the local trim/summarize length
 #: estimates. Anthropic's tokenizer would be more accurate but would
