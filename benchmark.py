@@ -8,6 +8,8 @@ A/B experiment runner for the inverse-model hypothesis.
 Usage:
   python benchmark.py                    # run the full task set
   python benchmark.py --task 0           # run only one task (filtered-list index)
+  python benchmark.py --task-id abc123   # run one task by GAIA task_id
+  python benchmark.py --level 2          # use Level 2 tasks
   python benchmark.py --condition A      # only condition A
   python benchmark.py --condition B      # only condition B
   python benchmark.py --model sonnet     # specific model
@@ -239,22 +241,25 @@ def is_truly_text_only(task: dict) -> bool:
     return True
 
 
-def load_gaia_tasks() -> list[dict]:
-    """Load GAIA validation set Level 1, truly text-only tasks.
+def load_gaia_tasks(level: int = 1) -> list[dict]:
+    """Load GAIA validation set, truly text-only tasks for *level*.
 
     Column schema (confirmed):
         task_id, Question, Level, Final answer, file_name, file_path,
         Annotator Metadata
-    Level 1 validation total: 53 tasks.
 
     Each returned dict is the GAIA row plus a derived ``max_steps`` key.
     Per-stage counts are logged to stdout for filter transparency.
     """
+    if level not in (1, 2, 3):
+        raise ValueError(
+            f"level must be 1, 2, or 3 (got {level!r})"
+        )
+
     from datasets import load_dataset  # type: ignore
 
-    gaia = load_dataset(
-        "gaia-benchmark/GAIA", "2023_level1", split="validation"
-    )
+    config = f"2023_level{level}"
+    gaia = load_dataset("gaia-benchmark/GAIA", config, split="validation")
 
     # Stage 1: empty file_name
     no_file = [t for t in gaia if not t.get("file_name")]
@@ -264,7 +269,7 @@ def load_gaia_tasks() -> list[dict]:
 
     total = len(gaia)
     excluded_by_url = len(no_file) - len(text_only)
-    print(f"[load_gaia_tasks] Level 1 total: {total}")
+    print(f"[load_gaia_tasks] Level {level} total: {total}")
     print(f"[load_gaia_tasks] After file_name filter: {len(no_file)}")
     print(f"[load_gaia_tasks] After multimodal URL filter: {len(text_only)}")
     print(
@@ -276,8 +281,21 @@ def load_gaia_tasks() -> list[dict]:
     enriched: list[dict] = []
     for t in text_only:
         row = dict(t)
-        row["max_steps"] = _max_steps_for_level(int(row.get("Level", 1)))
+        row["max_steps"] = _max_steps_for_level(int(row.get("Level", level)))
         enriched.append(row)
+
+    # Assert task_id uniqueness — protects cache key integrity.
+    seen_ids: set[str] = set()
+    for row in enriched:
+        tid = row["task_id"]
+        if tid in seen_ids:
+            raise RuntimeError(
+                f"Duplicate task_id {tid!r} in level {level} — "
+                "cache key integrity compromised"
+            )
+        seen_ids.add(tid)
+
+    print(f"[load_gaia_tasks] level={level} filtered_count={len(enriched)}")
     return enriched
 
 
@@ -1239,6 +1257,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run only one task (index into the filtered task list).",
     )
     parser.add_argument(
+        "--task-id",
+        type=str,
+        default=None,
+        help=(
+            "Run only one task by GAIA task_id. "
+            "Mutually exclusive with --task."
+        ),
+    )
+    parser.add_argument(
+        "--level",
+        type=int,
+        choices=[1, 2, 3],
+        default=1,
+        help="GAIA difficulty level to load (default: 1).",
+    )
+    parser.add_argument(
         "--condition",
         choices=["A", "B"],
         default=None,
@@ -1297,12 +1331,33 @@ def main(argv: list[str] | None = None) -> int:
     import random as _random
     _random.seed(SEED)
 
-    if args.task is not None or args.condition is not None:
+    # Mutual exclusion: --task (index) vs --task-id (string id)
+    if args.task is not None and args.task_id is not None:
+        print(
+            "Error: --task and --task-id are mutually exclusive. "
+            "Use one or the other.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.task is not None or args.task_id is not None or args.condition is not None:
         # Single-task / single-condition path is a Phase 6 smoke-test
         # convenience and is not the result-producing path.
-        tasks = load_gaia_tasks()
+        tasks = load_gaia_tasks(level=args.level)
         tasks = apply_sample_size_contingency(tasks)
-        if args.task is not None:
+        if args.task_id is not None:
+            matched = [t for t in tasks if t["task_id"] == args.task_id]
+            if not matched:
+                sample_ids = [t["task_id"] for t in tasks[:5]]
+                print(
+                    f"Error: task_id {args.task_id!r} not found in "
+                    f"level {args.level} tasks. "
+                    f"First 5 available: {sample_ids}",
+                    file=sys.stderr,
+                )
+                return 1
+            tasks = matched
+        elif args.task is not None:
             tasks = [tasks[args.task]]
         log_cost_start()
         rows: list[dict] = []
