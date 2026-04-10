@@ -52,6 +52,41 @@ This is the single-best explanation that is consistent with all 6 pilot tasks (s
 
 ---
 
+## 3.5. Decisive moments in this session
+
+Three turns initiated by Elden altered the session's trajectory. Each was a frame change, not a data point.
+
+1. **Entropy demoted to secondary tool** (after Task 3)
+   Elden observed that entropy was originally designed as an auxiliary observation tool, not as a primary success metric. Reframing: primary = correctness / termination mode / token cost; secondary = H_raw and H_improved. Every subsequent interpretation in this session operated under this frame. Without this reframe, Task 3's H_raw=0 alongside a correct answer would have been read as a failure of the threshold intervention rather than as confirmation that H_raw ≠ correctness.
+
+2. **Suspicion of the summarization layer** (after Task 4)
+   Elden asked whether `summarize_to_head` itself could be causing distortion. Until this point, Claude had been treating `inverse()` as a black box whose effects were observable only at the output. This question redirected the investigation toward pipeline internals. Without it, the session would likely have ended with a conclusion that inverse() does not improve GAIA performance — a false negative.
+
+3. **Request to read inverse.py source** (after Task 5)
+   Elden provided the `inverse.py` source and the two spec documents. Reading `inverse()` §6 directly revealed Finding 1 (spec-compliant implementation) and Finding 2 (80-token re-compression bottleneck). This was the single highest-signal action of the session in terms of explanatory power per minute invested.
+
+### Hypothesis amplitude during the session
+
+The working interpretation of pilot results shifted as data arrived:
+
+1. After Task 1: "threshold=0.08 did not resolve H_raw collapse"
+2. After Task 2: "B detects under-specification" (first appearance, from the refusal output)
+3. After Task 3: "A ≈ B when both succeed; B only wins on failure"
+4. After Task 4: "B is not reliably efficient; B/A token ratio varies with task structure, not with difficulty"
+5. After reading inverse.py: "All of the above are symptoms of inverse model output being re-compressed to a single sentence before reaching the agent; the true variable is how much inverse-model structure survives compression for each task"
+
+Interpretation 5 is the current Finding 2 hypothesis. It awaits confirmation in Phase 7.5.A. Interpretations 1-4 are now treated as artifacts of incomplete pipeline visibility.
+
+### Operational anomaly: Task 5 background detach
+
+Claude Code auto-detached `benchmark.py` to background during Task 5 execution. The `bash_tool`'s foreground "timeout 30m" did not apply to the detached process. While Claude (in this session) was drafting a kill prompt based on the assumption that the process was stuck, the process self-terminated with exit code 0 at 1984.5 seconds (33.1 minutes) and wrote valid TSV data.
+
+Claude Code then labeled Task 5 as ABORTED because wall-clock exceeded the 30-minute hard limit, per a literal reading of the batch prompt's abort condition (c). Claude (in this session) recovered the data by instructing Claude Code to copy `results.tsv` to `pilot_676e5e31.tsv` before the next task could clobber it, and to rewrite the ABORTED line in `pilot_batch_summary.txt` as a normal summary line.
+
+Lesson: abort conditions should be read by intent (prevent runaway cost) rather than by letter (kill anything over N minutes). A self-terminated overrun with valid output is not an abort case. This lesson is codified in §9 Operational lessons and in the safety notes of §10.
+
+---
+
 ## 4. Pilot results — primary metric matrix
 
 Entropy is set aside here (it is a secondary observation tool, per Session 2 reframing). Primary metrics: correctness, termination mode, token cost, B/A ratio.
@@ -186,10 +221,68 @@ Working method: I (Elden) do not let you write code directly. You produce Claude
 
 Before executing: acknowledge the checkpoint, identify anything ambiguous in §8 Step 7.5.A, and propose the Claude Code prompt. Entropy is a secondary tool now — do not get distracted by H_raw values.
 
+When producing the next checkpoint at the close of this session, follow the template in §13 of the checkpoint loaded above. Inherit its structure, inherit §10 Safety notes with any additions from this session's Operational lessons, and do not rewrite the template itself unless you have a structural reason documented in that checkpoint's §1 framing.
+
 ---
 
 [PASTE FULL CONTENTS OF CHECKPOINT_03_pilot_complete_with_bottleneck_finding.md HERE]
 ```
+
+---
+
+## 13. Template for future checkpoints
+
+This section is inherited by every subsequent checkpoint. When producing a new checkpoint, copy this template structure forward and amend §10 Safety notes with any new operational lessons. Do not rewrite the template itself unless there is a structural reason to do so (and if you do, document the reason in that checkpoint's §1 framing).
+
+### Structure
+
+Every checkpoint has two kinds of sections.
+
+**Technical sections** — for a future Claude session to resume from:
+- Git state and HEAD hash
+- Current pipeline configuration and any constants that changed this session
+- Next state transition with concrete commands, abort conditions, and decision gates
+- Budget state (spent this session, cumulative, estimated for next phase)
+- Safety notes, inherited from the previous checkpoint and amended with new lessons
+- Bootstrap block for the next session
+
+**Narrative sections** — for a future Elden (or a future Claude reading as Elden's proxy) to understand how we got here:
+- Framing — one sentence naming the kind of session this was (exploration / evaluation / diagnostic / refactor / recovery / other)
+- Findings — numbered, in order of discovery, each stated as a claim that can be either confirmed or refuted later
+- Decisive moments — turns where a hypothesis flipped, a frame was redefined, or an operator judgment call altered the trajectory. Attribute the initiator (Elden / Claude / Claude Code) for each
+- Hypothesis amplitude — when a working hypothesis changed during the session, record the sequence of interpretations in order. This is what distinguishes a diagnostic session from a clean one
+- Operational lessons — one-line takeaways that change how future sessions should be run. These become candidates for next checkpoint's safety notes
+
+### Minimum checklist
+
+Skip a row only with explicit justification in the checkpoint itself.
+
+- [ ] Framing sentence in §1
+- [ ] At least one Finding with clear claim / evidence / status
+- [ ] Decisive moments section, even if only one bullet
+- [ ] Next state transition with abort conditions
+- [ ] Budget state
+- [ ] Bootstrap block
+
+### Rule of thumb: narrative vs technical
+
+If the content would survive unchanged across sessions, it is technical. If the content only makes sense inside the story of this particular session, it is narrative.
+
+Example: "CACHE_VERSION is v2.8.1-003" is technical. "We bumped CACHE_VERSION because Finding 2 required invalidating clusterings computed under the prior compose template" is narrative.
+
+Both belong in the checkpoint. Keep them in separate sections so future readers can filter to the level they need.
+
+### Inheritance rules
+
+A new checkpoint **inherits**:
+- Safety notes from the previous checkpoint, with new lessons appended
+- This §13 template itself, copied forward
+
+A new checkpoint **does NOT inherit**:
+- Narrative sections (Findings, Decisive moments, Hypothesis amplitude) — those are specific to the session that produced them
+- The previous checkpoint's Next state transition — the new one replaces it
+
+To reconstruct the full project history, read checkpoints in order from CHECKPOINT_01 through the current one. No single checkpoint contains the whole story; the sequence does.
 
 ---
 
