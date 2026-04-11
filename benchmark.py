@@ -50,9 +50,6 @@ from inverse import (
     detect_loop,
     inverse,
     measure_semantic_entropy,
-    summarize_to_body,
-    summarize_to_head,
-    trim_to_tail,
 )
 from agent_tools import (
     TOOL_SCHEMA,
@@ -66,9 +63,8 @@ from agent_tools import (
 # ---------------------------------------------------------------------------
 
 #: Single LLM model used for ALL generation roles in v0:
-#: inverse(), summarize_to_head(), measure_semantic_entropy() sampling,
-#: and the ReAct agent. Single-model policy -- see
-#: implementation/agent-tools.md.
+#: inverse(), measure_semantic_entropy() sampling, and the ReAct agent.
+#: Single-model policy -- see implementation/agent-tools.md.
 MODEL: str = "claude-sonnet-4-6"
 
 #: Entropy-measurement sample count. Floor for the noise-cancellation
@@ -79,7 +75,7 @@ N_SAMPLES: int = 10
 #: Cache version. Bump on any change to model, N_SAMPLES, clustering
 #: threshold, or any prompt template that affects a cached value.
 #: See implementation/caching.md.
-CACHE_VERSION: str = "v2.8.1-002"
+CACHE_VERSION: str = "v2.9.0-001"
 
 #: Seed for any future stochastic operation. The embedder and clusterer
 #: are deterministic by construction; this seed exists as a fixed entry
@@ -388,24 +384,22 @@ def run_task_both_conditions(task: dict) -> list[dict]:
     if cache_hit("h_raw", task_key):
         cached = cache_get("h_raw", task_key)
         H_raw = cached["H_raw"]
-        raw_summary = cached["raw_summary"]
+        raw_prompt = cached["raw_prompt"]
     else:
-        # The token counts from these two calls are intentionally
-        # discarded at the row level: row total_tokens accounts only
-        # for tokens from inside run_react_loop. Pre/post-loop tokens
-        # are billed by Phase 5's cost monitoring layer instead.
-        raw_summary, _ = summarize_to_head(
-            task["Question"], max_tokens=80, model=MODEL
-        )
+        raw_prompt = task["Question"]
+        # Token counts from this call are intentionally discarded at
+        # the row level: row total_tokens accounts only for tokens
+        # from inside run_react_loop. Pre/post-loop tokens are billed
+        # by Phase 5's cost monitoring layer instead.
         H_raw, _ = measure_semantic_entropy(
-            f"{MINIMAL_INSTRUCTION}\n\n{raw_summary}",
+            f"{MINIMAL_INSTRUCTION}\n\n{raw_prompt}",
             model=MODEL,
             n_samples=N_SAMPLES,
         )
         cache_set(
             "h_raw",
             task_key,
-            {"H_raw": H_raw, "raw_summary": raw_summary},
+            {"H_raw": H_raw, "raw_prompt": raw_prompt},
         )
 
     # Step 2: Condition A
@@ -414,7 +408,7 @@ def run_task_both_conditions(task: dict) -> list[dict]:
         condition="A",
         H_raw=H_raw,
         H_improved=H_raw,
-        summarized_query=raw_summary,
+        task_prompt=task["Question"],
         model=MODEL,
     )
 
@@ -431,13 +425,10 @@ def run_task_both_conditions(task: dict) -> list[dict]:
 
     # H_improved: deliberately NOT cached -- inverse cache corruption
     # surfaces here. See implementation/caching.md. Token counts from
-    # these two calls are intentionally discarded at the row level
-    # (see the equivalent block above for H_raw).
-    improved_summary, _ = summarize_to_head(
-        improved_prompt, max_tokens=80, model=MODEL
-    )
+    # this call are intentionally discarded at the row level (see the
+    # equivalent block above for H_raw).
     H_improved, _ = measure_semantic_entropy(
-        f"{MINIMAL_INSTRUCTION}\n\n{improved_summary}",
+        f"{MINIMAL_INSTRUCTION}\n\n{improved_prompt}",
         model=MODEL,
         n_samples=N_SAMPLES,
     )
@@ -447,7 +438,7 @@ def run_task_both_conditions(task: dict) -> list[dict]:
         condition="B",
         H_raw=H_raw,
         H_improved=H_improved,
-        summarized_query=improved_summary,
+        task_prompt=improved_prompt,
         model=MODEL,
     )
 
@@ -459,15 +450,24 @@ def run_single_task(
     condition: str,
     H_raw: float,
     H_improved: float,
-    summarized_query: str,
+    task_prompt: str,
     model: str,
 ) -> dict:
     """Run one task under one condition. Returns one TSV row."""
     result = run_react_loop(
-        summarized_query=summarized_query,
+        task_prompt=task_prompt,
         model=model,
         max_steps=task["max_steps"],
         H_raw=H_raw,
+    )
+
+    # Phase 8.0: log per-step entropy curve to results/entropy_steps.tsv.
+    # One row per step. Append mode; header written only if the file is new.
+    _append_entropy_steps(
+        task_id=task["task_id"],
+        condition=condition,
+        level=task["Level"],
+        entropy_curve=result["entropy_curve"],
     )
 
     # Verifier: called exactly once, only on completed.
@@ -492,6 +492,42 @@ def run_single_task(
         "terminated_by": result["terminated_by"],
         "verifier_passed": verifier_passed,
     }
+
+
+#: Phase 8.0: per-step entropy curve log. One row per entropy measurement.
+ENTROPY_STEPS_PATH: Path = RESULTS_DIR / "entropy_steps.tsv"
+_ENTROPY_STEPS_COLUMNS: list[str] = ["task_id", "condition", "level", "step", "H_n"]
+
+
+def _append_entropy_steps(
+    task_id: str,
+    condition: str,
+    level: object,
+    entropy_curve: list[float],
+) -> None:
+    """Append per-step entropy rows to results/entropy_steps.tsv.
+
+    Writes the header only if the file does not yet exist. One row per
+    element in ``entropy_curve`` (step index is 1-based).
+    """
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    write_header = not ENTROPY_STEPS_PATH.exists()
+    with ENTROPY_STEPS_PATH.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=_ENTROPY_STEPS_COLUMNS, delimiter="\t"
+        )
+        if write_header:
+            writer.writeheader()
+        for step_index, H_n in enumerate(entropy_curve, start=1):
+            writer.writerow(
+                {
+                    "task_id": task_id,
+                    "condition": condition,
+                    "level": level,
+                    "step": step_index,
+                    "H_n": H_n,
+                }
+            )
 
 
 #: Per-call max_tokens for the agent's Thought + Action generation.
@@ -520,9 +556,8 @@ def _format_step_raw(
 ) -> str:
     """Build the raw text record of one ReAct step.
 
-    Used as the input to ``trim_to_tail`` for the next step's Tail and
-    eventually as the input to ``summarize_to_body`` once the step
-    slides past the n-2 boundary.
+    Appended to ``step_history`` so the next step's context is
+    head + all previous steps.
 
     Format:
         Thought: <text>
@@ -691,24 +726,28 @@ def _call_agent_with_retries(
 
 
 def run_react_loop(
-    summarized_query: str,
+    task_prompt: str,
     model: str,
     max_steps: int,
     H_raw: float,
 ) -> dict:
-    """The ReAct loop. Implements the [a]-[h] per-step flow from
-    implementation/react-loop.md.
+    """The ReAct loop.
+
+    Phase 8.0: the context is Head + full step history (no Body
+    summarisation, no Tail trimming). Entropy is measured AFTER the
+    just-completed step has been appended to step_history, so H_n
+    reflects the agent's state including that step.
 
     Parameters
     ----------
-    summarized_query : str
-        The 80-token Head string for THIS task. Locked at the start of
-        execution and never modified -- this is the agent's goal anchor
-        per spec/token-budget.md.
+    task_prompt : str
+        The full task prompt (raw question in Condition A, improved
+        prompt in Condition B). Locked at the start of execution and
+        reused verbatim as the agent's goal anchor.
     model : str
         The single LLM model used for the Thought/Action calls AND for
-        every measure_semantic_entropy / summarize_to_body call inside
-        the loop. Single-model policy per implementation/agent-tools.md.
+        measure_semantic_entropy inside the loop. Single-model policy
+        per implementation/agent-tools.md.
     max_steps : int
         Per-task step budget. Derived from GAIA Level (15 for Level 1).
         See implementation/gaia-integration.md.
@@ -725,85 +764,29 @@ def run_react_loop(
         - entropy_curve  : list[float]  (H_n at every step, in order)
         - total_tokens   : int  (sum across every LLM call inside this loop)
     """
-    # ---------------------------------------------------------------
-    # Per-loop state
-    # ---------------------------------------------------------------
-
-    # The Head is the locked 80-token Goal anchor. It is constructed
-    # ONCE here and reused for every step's [a] context build. The
-    # caller has already passed in summarized_query as a freshly
-    # summarised 80-token Head; we prepend MINIMAL_INSTRUCTION to it
-    # so the agent's user message and the entropy measurement input
-    # share the same shape.
-    head: str = f"{MINIMAL_INSTRUCTION}\n\n{summarized_query}"
+    # The Head is constructed ONCE here and reused for every step's
+    # context build. MINIMAL_INSTRUCTION is prepended so the agent's
+    # user message and the entropy measurement input share the same
+    # shape.
+    head: str = f"{MINIMAL_INSTRUCTION}\n\n{task_prompt}"
 
     entropy_curve: list[float] = []
     total_tokens: int = 0
 
-    # Recursive Body summary. Empty on cold start; populated from step
-    # 3 onward when the first content slides past the n-2 boundary.
-    previous_body: str = ""
-
-    # Two raw history slots, carried between iterations:
-    #   step_n_minus_1_raw : the raw thought+action+observation text
-    #     from the immediately previous step (becomes step n's Tail
-    #     input via trim_to_tail).
-    #   step_n_minus_2_raw : the raw text from two steps ago (becomes
-    #     step n's "displaced into Body" input via summarize_to_body).
-    # Both start as None and are populated as steps execute.
-    step_n_minus_1_raw: str | None = None
-    step_n_minus_2_raw: str | None = None
+    # Full history of formatted step records (Thought/Action/Observation
+    # blocks, in order). Grows by one entry per completed step.
+    step_history: list[str] = []
 
     client = _get_anthropic_client()
 
     for step_num in range(1, max_steps + 1):
-        # -----------------------------------------------------------
-        # [a] Build context (300 tokens: Head + Body + Tail)
-        # -----------------------------------------------------------
-
-        # Body update: only happens once step_n_minus_2_raw is set,
-        # i.e. from step 3 onward. Steps 1 and 2 keep new_body == "".
-        if step_n_minus_2_raw is not None:
-            new_body, body_tokens = summarize_to_body(
-                previous_body,
-                step_n_minus_2_raw,
-                model=model,
-            )
-            total_tokens += body_tokens
+        # Build the agent's context: Head + everything we have done so far.
+        if step_history:
+            context = head + "\n\n" + "\n\n".join(step_history)
         else:
-            new_body = previous_body  # still empty for steps 1 and 2
+            context = head
 
-        # Tail update: only happens once step_n_minus_1_raw is set,
-        # i.e. from step 2 onward. Step 1 keeps new_tail == "".
-        if step_n_minus_1_raw is not None:
-            new_tail = trim_to_tail(step_n_minus_1_raw, max_tokens=150)
-        else:
-            new_tail = ""
-
-        # Filter empty slots so cold-start contexts (step 1, step 2)
-        # do not have stray double-blank-line gaps. The agent and the
-        # entropy measurement see a clean Head[+Body][+Tail] shape.
-        parts: list[str] = [head]
-        if new_body:
-            parts.append(new_body)
-        if new_tail:
-            parts.append(new_tail)
-        context: str = "\n\n".join(parts)
-
-        # -----------------------------------------------------------
-        # [b] Measure semantic entropy BEFORE the Thought
-        # -----------------------------------------------------------
-        H_n, h_n_tokens = measure_semantic_entropy(
-            context,
-            model=model,
-            n_samples=N_SAMPLES,
-        )
-        entropy_curve.append(H_n)
-        total_tokens += h_n_tokens
-
-        # -----------------------------------------------------------
-        # [c] + [d] Thought + Action via the Anthropic Messages API
-        # -----------------------------------------------------------
+        # Thought + Action via the Anthropic Messages API.
         thought_text, tool_use, call_tokens, status = (
             _call_agent_with_retries(client, model, context)
         )
@@ -821,31 +804,21 @@ def run_react_loop(
         action_name: str = tool_use.name
         action_input: dict = dict(tool_use.input or {})
 
-        # -----------------------------------------------------------
-        # [d] / [e] Tool dispatch with final_answer interception
-        # -----------------------------------------------------------
+        # Tool dispatch with final_answer interception.
         observation: object | None = None
         pending_completion: bool = False
         captured_answer: str | None = None
 
         if action_name == "final_answer":
             # INTERCEPT — do NOT dispatch the Python passthrough.
-            # The agent's final_answer tool-use block is captured
-            # here and surfaces at [g] (unless [f] fires first).
             pending_completion = True
             captured_answer = action_input.get("answer", "")
-            # No observation for this step.
         elif action_name == "tavily_search":
             try:
                 observation = _cached_tavily_search(
                     action_input.get("query", "")
                 )
             except Exception:
-                # Tool exception -> error termination per
-                # operations/failure-modes.md. Tavily errors that come
-                # back as a structured response (rather than as a
-                # raised exception) would NOT take this path -- they
-                # would be assigned to `observation` normally.
                 return {
                     "terminated_by": "error",
                     "final_answer": None,
@@ -866,8 +839,7 @@ def run_react_loop(
                 }
         else:
             # Unknown tool name. Defensive: TOOL_SCHEMA only exposes
-            # three tools, so this should be unreachable. If reached,
-            # treat as an error rather than crash the run.
+            # three tools, so this should be unreachable.
             return {
                 "terminated_by": "error",
                 "final_answer": None,
@@ -875,25 +847,30 @@ def run_react_loop(
                 "total_tokens": total_tokens,
             }
 
-        # Build the raw text record for THIS step. Used as the next
-        # step's Tail input and (two steps later) as the displaced
-        # content for the Body update.
+        # Build the raw text record for THIS step and append it to
+        # step_history BEFORE the entropy measurement, so H_n reflects
+        # the agent's state including the just-completed step.
         current_step_raw = _format_step_raw(
             thought=thought_text,
             action_name=action_name,
             action_input=action_input,
             observation=observation,
         )
+        step_history.append(current_step_raw)
 
-        # -----------------------------------------------------------
-        # [f] Loop detection
-        #
-        # Runs even on a final_answer step. If the loop detector
-        # fires simultaneously with a final_answer call, the loop
-        # wins -- loop_detected is the dependent variable of the
-        # hypothesis. See spec/loop-detection.md and react-loop.md
-        # §[g] "The completion check happens after loop detection."
-        # -----------------------------------------------------------
+        updated_context = head + "\n\n" + "\n\n".join(step_history)
+
+        H_n, h_n_tokens = measure_semantic_entropy(
+            updated_context,
+            model=model,
+            n_samples=N_SAMPLES,
+        )
+        entropy_curve.append(H_n)
+        total_tokens += h_n_tokens
+
+        # Loop detection. Runs even on a final_answer step; the loop
+        # detector wins over a simultaneous final_answer, per
+        # spec/loop-detection.md and react-loop.md §[g].
         loop_result = detect_loop(
             entropy_curve, H_raw, alpha=0.3, window=3
         )
@@ -905,9 +882,7 @@ def run_react_loop(
                 "total_tokens": total_tokens,
             }
 
-        # -----------------------------------------------------------
-        # [g] Completion check
-        # -----------------------------------------------------------
+        # Completion check.
         if pending_completion:
             return {
                 "terminated_by": "completed",
@@ -916,9 +891,7 @@ def run_react_loop(
                 "total_tokens": total_tokens,
             }
 
-        # -----------------------------------------------------------
-        # [h] max_steps check
-        # -----------------------------------------------------------
+        # max_steps check.
         if step_num >= max_steps:
             return {
                 "terminated_by": "max_steps_reached",
@@ -927,19 +900,8 @@ def run_react_loop(
                 "total_tokens": total_tokens,
             }
 
-        # -----------------------------------------------------------
-        # End-of-step bookkeeping shift.
-        #
-        # Update n-2 BEFORE overwriting n-1, otherwise we lose the
-        # value we are about to assign.
-        # -----------------------------------------------------------
-        step_n_minus_2_raw = step_n_minus_1_raw
-        step_n_minus_1_raw = current_step_raw
-        previous_body = new_body
-
-    # Defensive: the [h] check inside the loop should always exit
-    # before falling out of the for-loop. If we somehow reach here,
-    # treat it as max_steps_reached so the row is at least valid.
+    # Defensive: the max_steps check inside the loop should always
+    # exit before falling out of the for-loop.
     return {
         "terminated_by": "max_steps_reached",
         "final_answer": None,
