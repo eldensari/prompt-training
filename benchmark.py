@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import hashlib
 import json
 import os
@@ -459,6 +460,9 @@ def run_single_task(
         model=model,
         max_steps=task["max_steps"],
         H_raw=H_raw,
+        task_id=task["task_id"],
+        condition=condition,
+        level=task["Level"],
     )
 
     # Phase 8.0: log per-step entropy curve to results/entropy_steps.tsv.
@@ -528,6 +532,96 @@ def _append_entropy_steps(
                     "H_n": H_n,
                 }
             )
+
+
+# ---------------------------------------------------------------------------
+# Per-step trace sidecar (Phase 8.1.A)
+# ---------------------------------------------------------------------------
+
+#: Maximum character length for the observation field in a trace row.
+#: Observations longer than this are truncated; observation_truncated
+#: is set to True and observation_full_len records the original length.
+_TRACE_OBS_CHAR_LIMIT: int = 8_000
+
+
+def _write_trace_sidecar_meta(
+    task_id: str,
+    condition: str,
+    level: object,
+    head: str,
+) -> Path:
+    """Create a fresh trace sidecar and write the meta header line.
+
+    Returns the ``Path`` so callers can pass it to ``_append_trace_step``.
+    Raises on file errors — if the file cannot be created, the run should
+    fail loudly.
+    """
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    trace_path = RESULTS_DIR / f"trace_{task_id}_{condition}.jsonl"
+    meta = {
+        "_meta": True,
+        "task_id": task_id,
+        "condition": condition,
+        "level": str(level),
+        "head": head,
+        "schema_version": 1,
+    }
+    with trace_path.open("w", encoding="utf-8", newline="") as f:
+        f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+    return trace_path
+
+
+def _append_trace_step(
+    trace_path: Path,
+    step: int,
+    thought: str,
+    action_name: str,
+    action_input: dict,
+    observation: object | None,
+    entropy: float,
+) -> None:
+    """Append one step row to the trace sidecar JSONL file.
+
+    Truncates *observation* to ``_TRACE_OBS_CHAR_LIMIT`` characters.
+    For ``final_answer`` steps *observation* is ``None`` — stored as
+    ``null`` with ``observation_truncated: false, observation_full_len: 0``.
+
+    File errors are caught and logged to stderr so that trace failures
+    never break the benchmark run.
+    """
+    if observation is None:
+        obs_text: str | None = None
+        obs_truncated = False
+        obs_full_len = 0
+    else:
+        try:
+            obs_text = json.dumps(observation, ensure_ascii=False, indent=2)
+        except Exception:
+            obs_text = repr(observation)
+        obs_full_len = len(obs_text)
+        if obs_full_len > _TRACE_OBS_CHAR_LIMIT:
+            obs_text = obs_text[:_TRACE_OBS_CHAR_LIMIT]
+            obs_truncated = True
+        else:
+            obs_truncated = False
+
+    row = {
+        "step": step,
+        "thought": thought,
+        "action_name": action_name,
+        "action_args": action_input,
+        "observation": obs_text,
+        "observation_truncated": obs_truncated,
+        "observation_full_len": obs_full_len,
+        "entropy": entropy,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    try:
+        with trace_path.open("a", encoding="utf-8", newline="") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[trace] WARNING: could not write step {step} to {trace_path}: {exc}",
+              file=sys.stderr)
 
 
 #: Per-call max_tokens for the agent's Thought + Action generation.
@@ -730,6 +824,10 @@ def run_react_loop(
     model: str,
     max_steps: int,
     H_raw: float,
+    *,
+    task_id: str,
+    condition: str,
+    level: object,
 ) -> dict:
     """The ReAct loop.
 
@@ -755,6 +853,12 @@ def run_react_loop(
         The per-task baseline used by detect_loop. The SAME H_raw is
         passed in for both conditions A and B -- never H_improved in B,
         per spec/loop-detection.md (c).
+    task_id : str
+        GAIA task identifier. Used for trace sidecar file naming.
+    condition : str
+        "A" or "B". Used for trace sidecar file naming.
+    level : object
+        GAIA level (e.g. 1, 2, 3). Recorded in trace meta header.
 
     Returns
     -------
@@ -769,6 +873,10 @@ def run_react_loop(
     # user message and the entropy measurement input share the same
     # shape.
     head: str = f"{MINIMAL_INSTRUCTION}\n\n{task_prompt}"
+
+    # Phase 8.1.A: write the trace sidecar meta header. This CAN raise
+    # — if the file cannot be created, fail loudly.
+    trace_path: Path = _write_trace_sidecar_meta(task_id, condition, level, head)
 
     entropy_curve: list[float] = []
     total_tokens: int = 0
@@ -867,6 +975,22 @@ def run_react_loop(
         )
         entropy_curve.append(H_n)
         total_tokens += h_n_tokens
+
+        # Phase 8.1.A: append per-step trace row. Wrapped in try/except
+        # so trace failures never break the benchmark run.
+        try:
+            _append_trace_step(
+                trace_path,
+                step=step_num,
+                thought=thought_text,
+                action_name=action_name,
+                action_input=action_input,
+                observation=observation,
+                entropy=H_n,
+            )
+        except Exception as exc:
+            print(f"[trace] WARNING: _append_trace_step failed at step {step_num}: {exc}",
+                  file=sys.stderr)
 
         # Loop detection. Runs even on a final_answer step; the loop
         # detector wins over a simultaneous final_answer, per
