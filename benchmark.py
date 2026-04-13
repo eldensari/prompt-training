@@ -378,7 +378,7 @@ def run_experiment() -> None:
     log_cost_end()
 
 
-def run_task_both_conditions(task: dict) -> list[dict]:
+def run_task_both_conditions(task: dict, *, executor_model: str | None = None) -> list[dict]:
     """Run one task under both A and B. Returns a list of two rows."""
     task_key = _cache_key(task["task_id"], MODEL, N_SAMPLES)
 
@@ -414,6 +414,7 @@ def run_task_both_conditions(task: dict) -> list[dict]:
         H_improved=H_raw,
         task_prompt=task["Question"],
         model=MODEL,
+        executor_model=executor_model,
     )
 
     # Step 3: Condition B -- inverse() with its own cache. Same
@@ -444,6 +445,7 @@ def run_task_both_conditions(task: dict) -> list[dict]:
         H_improved=H_improved,
         task_prompt=improved_prompt,
         model=MODEL,
+        executor_model=executor_model,
     )
 
     return [row_A, row_B]
@@ -456,6 +458,8 @@ def run_single_task(
     H_improved: float,
     task_prompt: str,
     model: str,
+    *,
+    executor_model: str | None = None,
 ) -> dict:
     """Run one task under one condition. Returns one TSV row."""
     result = run_react_loop(
@@ -466,6 +470,7 @@ def run_single_task(
         task_id=task["task_id"],
         condition=condition,
         level=task["Level"],
+        executor_model=executor_model,
     )
 
     # Phase 8.0: log per-step entropy curve to results/entropy_steps.tsv.
@@ -832,6 +837,7 @@ def run_react_loop(
     task_id: str,
     condition: str,
     level: object,
+    executor_model: str | None = None,
 ) -> dict:
     """The ReAct loop.
 
@@ -900,7 +906,7 @@ def run_react_loop(
 
         # Thought + Action via the Anthropic Messages API.
         thought_text, tool_use, call_tokens, status = (
-            _call_agent_with_retries(client, model, context)
+            _call_agent_with_retries(client, executor_model or model, context)
         )
         total_tokens += call_tokens
 
@@ -1375,6 +1381,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override the MODEL constant for this run.",
     )
     parser.add_argument(
+        "--executor-model",
+        type=str,
+        default=None,
+        help="Override the executor model (default: same as --model).",
+    )
+    parser.add_argument(
         "--n-samples",
         type=int,
         default=None,
@@ -1405,6 +1417,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.model:
         MODEL = args.model
+    if args.executor_model is None:
+        args.executor_model = MODEL
     if args.n_samples:
         N_SAMPLES = args.n_samples
     if args.no_cache:
@@ -1452,7 +1466,7 @@ def main(argv: list[str] | None = None) -> int:
         log_cost_start()
         rows: list[dict] = []
         for task in tasks:
-            both = run_task_both_conditions(task)
+            both = run_task_both_conditions(task, executor_model=args.executor_model)
             if args.condition is not None:
                 both = [r for r in both if r["condition"] == args.condition]
             rows.extend(both)
