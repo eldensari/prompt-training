@@ -94,6 +94,8 @@ TSV_PATH: Path = RESULTS_DIR / "results.tsv"
 
 #: TSV column order. NOT editable without a version bump (see
 #: operations/experiment-rules.md).
+#: Adding output-only columns (e.g. trace_path) does not affect cache
+#: geometry and does not require a CACHE_VERSION bump.
 TSV_COLUMNS: list[str] = [
     "task_id",
     "level",
@@ -105,6 +107,7 @@ TSV_COLUMNS: list[str] = [
     "total_tokens",
     "terminated_by",
     "verifier_passed",
+    "trace_path",
 ]
 
 #: Whether caching is enabled. Set by CLI; mutated by --no-cache.
@@ -495,6 +498,7 @@ def run_single_task(
         "total_tokens": result["total_tokens"],
         "terminated_by": result["terminated_by"],
         "verifier_passed": verifier_passed,
+        "trace_path": (RESULTS_DIR / f"trace_{task['task_id']}_{condition}.jsonl").as_posix(),
     }
 
 
